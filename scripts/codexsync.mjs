@@ -108,6 +108,11 @@ function atomicWrite(file, content, dryRun = false) {
   return true;
 }
 
+function testTrace(kind, file) {
+  const trace = process.env.CODEX_SYNC_TEST_TRACE;
+  if (trace) fs.appendFileSync(trace, `${kind}\t${normalizeFsPath(file)}\n`);
+}
+
 function writeJson(file, value, dryRun = false) {
   atomicWrite(file, `${JSON.stringify(value, null, 2)}\n`, dryRun);
 }
@@ -295,8 +300,58 @@ function copyAtomic(source, destination, dryRun = false) {
   atomicWrite(destination, fs.readFileSync(source), dryRun);
 }
 
+function backupLocalFiles(config, label, files, dryRun = false) {
+  if (dryRun) return [];
+  if (!config._localBackupState) Object.defineProperty(config, "_localBackupState", { value: { root: path.join(path.dirname(config._configFile), "backups", `${conflictStamp()}-${label}`), files: new Set() }, enumerable: false });
+  const state = config._localBackupState;
+  const copied = [];
+  for (const file of files.filter(Boolean)) {
+    const source = normalizeFsPath(file);
+    if (!fs.existsSync(source) || state.files.has(source)) continue;
+    const name = `${crypto.createHash("sha256").update(source).digest("hex").slice(0, 12)}-${path.basename(source)}`;
+    const destination = path.join(state.root, name);
+    testTrace("backup", source);
+    atomicWrite(destination, fs.readFileSync(source));
+    state.files.add(source);
+    copied.push(destination);
+  }
+  return copied;
+}
+
+function backupLocalMutation(config, label, rolloutPath, dryRun = false) {
+  return backupLocalFiles(config, label, [
+    rolloutPath,
+    path.join(config.codexHome, "session_index.jsonl"),
+    stateDbFile(config.codexHome, config.sqliteHome),
+    path.join(config.codexHome, "sqlite", "codex-dev.db"),
+  ], dryRun);
+}
+
 function detectCodexHome(options = {}) {
   return expandPath(options["codex-home"] ?? process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex"));
+}
+
+// Codex has used both CODEX_HOME/state_5.sqlite and a separate SQLite root in
+// different desktop builds.  Do not manufacture a database in either location:
+// return an existing database only, unless the caller explicitly supplied a
+// SQLite home.
+function detectSqliteHome(options = {}, codexHome = detectCodexHome(options)) {
+  const requested = options["codex-sqlite-home"] ?? process.env.CODEX_SQLITE_HOME;
+  if (requested) return expandPath(requested);
+  const candidates = [codexHome, path.join(codexHome, "sqlite")];
+  return candidates.find((candidate) => fs.existsSync(path.join(candidate, "state_5.sqlite"))) ?? null;
+}
+
+function stateDbFile(codexHome, sqliteHome = null) {
+  const candidates = sqliteHome ? [sqliteHome] : [codexHome, path.join(codexHome, "sqlite")];
+  for (const candidate of candidates) {
+    const file = candidate.endsWith(".sqlite") ? candidate : path.join(candidate, "state_5.sqlite");
+    if (fs.existsSync(file)) return file;
+  }
+  // An explicit home identifies the supported intended layout; callers still
+  // must not create it when Codex has not created the database.
+  if (sqliteHome) return sqliteHome.endsWith(".sqlite") ? sqliteHome : path.join(sqliteHome, "state_5.sqlite");
+  return null;
 }
 
 function configPath(options = {}) {
@@ -309,6 +364,7 @@ function loadConfig(options = {}) {
   if (config.version !== FORMAT_VERSION) throw new CodexSyncError(`Unsupported config version ${config.version}`);
   config.vault = expandPath(config.vault);
   config.codexHome = expandPath(config.codexHome);
+  config.sqliteHome = config.sqliteHome ? expandPath(config.sqliteHome) : detectSqliteHome(options, config.codexHome);
   config.skillSources = (config.skillSources ?? []).map((item) => ({ ...item, path: expandPath(item.path) }));
   Object.defineProperty(config, "_configFile", { value: file, enumerable: false, writable: true });
   return { config, file };
@@ -319,6 +375,7 @@ function saveConfig(file, config, dryRun = false) {
     ...config,
     vault: path.resolve(config.vault),
     codexHome: path.resolve(config.codexHome),
+    sqliteHome: config.sqliteHome ? path.resolve(config.sqliteHome) : null,
     skillSources: config.skillSources.map((item) => ({ ...item, path: path.resolve(item.path) })),
   };
   writeJson(file, serializable, dryRun);
@@ -362,8 +419,8 @@ function openDatabase(file, readOnly = false) {
   }
 }
 
-function listThreads(codexHome) {
-  const dbFile = path.join(codexHome, "state_5.sqlite");
+function listThreads(codexHome, sqliteHome = null) {
+  const dbFile = stateDbFile(codexHome, sqliteHome);
   const db = openDatabase(dbFile, true);
   if (db) {
     try {
@@ -377,8 +434,8 @@ function listThreads(codexHome) {
   });
 }
 
-function findRollout(codexHome, id) {
-  const db = openDatabase(path.join(codexHome, "state_5.sqlite"), true);
+function findRollout(codexHome, id, sqliteHome = null) {
+  const db = openDatabase(stateDbFile(codexHome, sqliteHome), true);
   if (db) {
     try {
       const row = db.prepare("SELECT rollout_path FROM threads WHERE id=?").get(id);
@@ -400,8 +457,8 @@ function findRollout(codexHome, id) {
   return null;
 }
 
-function threadRow(codexHome, id) {
-  const db = openDatabase(path.join(codexHome, "state_5.sqlite"), true);
+function threadRow(codexHome, id, sqliteHome = null) {
+  const db = openDatabase(stateDbFile(codexHome, sqliteHome), true);
   if (!db) return null;
   try { return db.prepare("SELECT * FROM threads WHERE id=?").get(id) ?? null; }
   finally { db.close(); }
@@ -416,13 +473,13 @@ function firstEventMetadata(snapshot) {
 function resolveThread(config, selector) {
   const candidate = selector === "current" ? process.env.CODEX_THREAD_ID : selector;
   if (!candidate) throw new CodexSyncError("Current thread ID is unavailable; pass a title fragment or thread ID.");
-  const threads = listThreads(config.codexHome);
+  const threads = listThreads(config.codexHome, config.sqliteHome);
   const exact = threads.find((item) => item.id === candidate);
   if (exact) return exact;
   const query = candidate.toLowerCase();
   const matches = threads.filter((item) => String(item.title ?? item.thread_name ?? "").toLowerCase().includes(query));
   if (matches.length === 1) return matches[0];
-  if (!matches.length && /^[0-9a-f-]{20,}$/i.test(candidate) && findRollout(config.codexHome, candidate)) {
+  if (!matches.length && /^[0-9a-f-]{20,}$/i.test(candidate) && findRollout(config.codexHome, candidate, config.sqliteHome)) {
     return { id: candidate, title: candidate };
   }
   if (!matches.length) throw new CodexSyncError(`No local thread matches: ${selector}`);
@@ -444,7 +501,21 @@ function applyPathMaps(value, maps = []) {
   return value;
 }
 
-function ensureThreadIndex(codexHome, metadata, rolloutPath, dryRun = false) {
+function localCwd(value, maps = []) {
+  const mapped = applyPathMaps(value, maps);
+  const foreignWindows = /^(?:[A-Za-z]:[\\/]|\\\\|\/\/|\\\\\?\\)/.test(String(mapped));
+  if (process.platform !== "win32" && foreignWindows) {
+    throw new CodexSyncError(`No local path mapping for Windows cwd: ${value}`);
+  }
+  if (process.platform === "win32" && /^\//.test(String(mapped))) {
+    throw new CodexSyncError(`No local path mapping for POSIX cwd: ${value}`);
+  }
+  return normalizeFsPath(mapped);
+}
+
+function ensureThreadIndex(config, metadata, rolloutPath, dryRun = false) {
+  const { codexHome, sqliteHome } = config;
+  backupLocalMutation(config, `index-${metadata.id}`, rolloutPath, dryRun);
   const row = metadata.row ?? {};
   const id = metadata.id;
   const created = Number(row.created_at ?? Math.floor(Date.parse(metadata.createdAt ?? nowIso()) / 1000));
@@ -457,7 +528,7 @@ function ensureThreadIndex(codexHome, metadata, rolloutPath, dryRun = false) {
     updated_at: updated,
     source: row.source ?? "cli",
     model_provider: row.model_provider ?? metadata.modelProvider ?? "openai",
-    cwd: normalizeFsPath(applyPathMaps(row.cwd ?? metadata.cwd ?? os.homedir(), metadata.pathMaps ?? [])),
+    cwd: localCwd(row.cwd ?? metadata.cwd ?? os.homedir(), metadata.pathMaps ?? []),
     title,
     sandbox_policy: row.sandbox_policy ?? "{\"type\":\"danger-full-access\"}",
     approval_mode: row.approval_mode ?? "never",
@@ -473,7 +544,7 @@ function ensureThreadIndex(codexHome, metadata, rolloutPath, dryRun = false) {
     updated_at_ms: Number(row.updated_at_ms ?? updated * 1000),
   };
   if (!dryRun) {
-    const db = openDatabase(path.join(codexHome, "state_5.sqlite"), false);
+    const db = openDatabase(stateDbFile(codexHome, sqliteHome), false);
     if (db) {
       try {
         const table = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='threads'").get();
@@ -484,6 +555,7 @@ function ensureThreadIndex(codexHome, metadata, rolloutPath, dryRun = false) {
           const placeholders = names.map(() => "?").join(",");
           const updates = ["rollout_path", "updated_at", "updated_at_ms", "title", "preview", "recency_at", "recency_at_ms", "has_user_event"]
             .filter((key) => names.includes(key)).map((key) => `${key}=excluded.${key}`).join(",");
+          testTrace("state", stateDbFile(codexHome, sqliteHome));
           db.prepare(`INSERT INTO threads (${names.join(",")}) VALUES (${placeholders}) ON CONFLICT(id) DO UPDATE SET ${updates}`)
             .run(...picked.map(([, value]) => value));
         }
@@ -491,12 +563,20 @@ function ensureThreadIndex(codexHome, metadata, rolloutPath, dryRun = false) {
     }
   }
   const indexFile = path.join(codexHome, "session_index.jsonl");
-  const existing = fs.existsSync(indexFile)
-    ? fs.readFileSync(indexFile, "utf8").split(/\r?\n/).filter(Boolean).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } })
-    : [];
-  const next = existing.filter((item) => item.id !== id);
-  next.push({ id, thread_name: values.title, updated_at: new Date(updated * 1000).toISOString() });
-  atomicWrite(indexFile, `${next.map((item) => JSON.stringify(item)).join("\n")}\n`, dryRun);
+  // Keep every original record byte-for-byte except the record superseded for
+  // this thread.  In particular, an unknown/future or malformed record must
+  // not be silently discarded while updating the local index.
+  const original = fs.existsSync(indexFile) ? fs.readFileSync(indexFile, "utf8") : "";
+  const ending = original.includes("\r\n") ? "\r\n" : "\n";
+  const records = original.match(/[^\r\n]*(?:\r\n|\n|$)/g) ?? [];
+  const preserved = records.filter((record) => {
+    const line = record.replace(/\r?\n$/, "");
+    if (!line) return true;
+    try { return JSON.parse(line).id !== id; } catch { return true; }
+  }).join("");
+  const separator = preserved && !preserved.endsWith("\n") ? ending : "";
+  testTrace("index", indexFile);
+  atomicWrite(indexFile, `${preserved}${separator}${JSON.stringify({ id, thread_name: values.title, updated_at: new Date(updated * 1000).toISOString() })}${ending}`, dryRun);
   if (!dryRun) updateLocalThreadCatalog(codexHome, values);
 }
 
@@ -505,6 +585,7 @@ function updateLocalThreadCatalog(codexHome, values) {
   const db = openDatabase(file, false);
   if (!db) return false;
   try {
+    testTrace("catalog", file);
     const table = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='local_thread_catalog'").get();
     if (!table) return false;
     const result = db.prepare("UPDATE local_thread_catalog SET display_title=?, source_updated_at=?, cwd=?, missing_candidate=0 WHERE thread_id=?")
@@ -686,7 +767,7 @@ function resolveProjectFolder(inventory, selector) {
 }
 
 function projectThreads(config, projectPath) {
-  return listThreads(config.codexHome).filter((thread) => {
+  return listThreads(config.codexHome, config.sqliteHome).filter((thread) => {
     if (Number(thread.archived ?? 0) !== 0 || !thread.cwd) return false;
     const localAbsolute = process.platform === "win32"
       ? path.win32.isAbsolute(stripWindowsExtendedPrefix(thread.cwd))
@@ -733,7 +814,7 @@ function codexProjectRoots(config) {
     roots.push({ path: resolved, label: path.basename(resolved), origin });
   };
   for (const root of configuredRoots) add(root, "codex-projects");
-  for (const thread of listThreads(config.codexHome)) add(thread.cwd, "thread-cwd");
+  for (const thread of listThreads(config.codexHome, config.sqliteHome)) add(thread.cwd, "thread-cwd");
   return roots.map((root) => ({ ...root, tasks: projectThreads(config, root.path).map((thread) => ({ id: thread.id, title: thread.title ?? thread.thread_name ?? thread.id, cwd: thread.cwd })) }));
 }
 
@@ -1002,6 +1083,7 @@ function initCommand(options) {
   const file = configPath(options);
   if (fs.existsSync(file) && !options.force) throw new CodexSyncError(`Config already exists: ${file} (use --force to replace)`);
   const codexHome = detectCodexHome(options);
+  const sqliteHome = detectSqliteHome(options, codexHome);
   let vault = expandPath(options.vault);
   if (!vault) throw new CodexSyncError("init requires --vault <path>");
   const transport = options.transport ?? "folder";
@@ -1016,6 +1098,7 @@ function initCommand(options) {
     vault,
     transport,
     codexHome,
+    sqliteHome,
     conversations: {},
     skillSources: commonSkillRoots(codexHome),
     projects: {},
@@ -1055,7 +1138,7 @@ function mergeSelections(config) {
 }
 
 function conversationMetadata(config, id, rollout, snapshot) {
-  const row = threadRow(config.codexHome, id);
+  const row = threadRow(config.codexHome, id, config.sqliteHome);
   const first = firstEventMetadata(snapshot);
   const relative = portableRelative(config.codexHome, rollout);
   if (!relative.startsWith("sessions/")) throw new CodexSyncError(`Rollout is outside Codex sessions: ${rollout}`);
@@ -1066,7 +1149,9 @@ function conversationMetadata(config, id, rollout, snapshot) {
     createdAt: row?.created_at ? new Date(Number(row.created_at) * 1000).toISOString() : first.timestamp,
     updatedAt: row?.updated_at ? new Date(Number(row.updated_at) * 1000).toISOString() : nowIso(),
     relativePath: relative,
-    cwd: normalizeFsPath(row?.cwd ?? first.cwd ?? os.homedir()),
+    // This is source-device metadata. Keep its native spelling; import maps it
+    // before it ever reaches a destination SQLite row.
+    cwd: row?.cwd ?? first.cwd ?? os.homedir(),
     cliVersion: row?.cli_version ?? first.cli_version,
     modelProvider: row?.model_provider ?? first.model_provider,
     row,
@@ -1081,7 +1166,7 @@ function portableConversationMetadata(metadata) {
     title: metadata.title,
     createdAt: metadata.createdAt,
     relativePath: metadata.relativePath,
-    cwd: normalizeFsPath(metadata.cwd ?? os.homedir()),
+    cwd: metadata.cwd ?? os.homedir(),
     cliVersion: metadata.cliVersion,
     modelProvider: metadata.modelProvider,
   };
@@ -1194,7 +1279,7 @@ function reconcileConversation(config, id, dryRun, summary) {
 }
 
 function exportConversation(config, id, dryRun, summary) {
-  const rollout = findRollout(config.codexHome, id);
+  const rollout = findRollout(config.codexHome, id, config.sqliteHome);
   if (!rollout) return false;
   const stable = stableConversationSnapshot(rollout);
   const snapshot = stable.snapshot;
@@ -1231,6 +1316,8 @@ function importConversation(config, id, canonical, dryRun, summary) {
   const relative = metadata.relativePath;
   if (!String(relative).startsWith("sessions/")) throw new CodexSyncError(`Unsafe conversation relative path: ${relative}`);
   const destination = safeJoin(config.codexHome, relative);
+  // Validate cross-platform cwd before any local rollout/index write.
+  localCwd(metadata.row?.cwd ?? metadata.cwd ?? os.homedir(), metadata.pathMaps ?? []);
   const local = fs.existsSync(destination) ? completeJsonlSnapshot(destination) : null;
   if (local && !isPrefix(local, canonical) && !isPrefix(canonical, local)) {
     summary.conversationConflicts += 1;
@@ -1238,11 +1325,13 @@ function importConversation(config, id, canonical, dryRun, summary) {
     return false;
   }
   if (!local || isPrefix(local, canonical)) {
+    backupLocalMutation(config, `import-${id}`, destination, dryRun);
+    testTrace("rollout", destination);
     atomicWrite(destination, canonical, dryRun);
-    ensureThreadIndex(config.codexHome, metadata, destination, dryRun);
+    ensureThreadIndex(config, metadata, destination, dryRun);
     summary.conversationsPulled += 1;
   } else if (isPrefix(canonical, local)) {
-    ensureThreadIndex(config.codexHome, metadata, destination, dryRun);
+    ensureThreadIndex(config, metadata, destination, dryRun);
   }
   return true;
 }
@@ -1385,14 +1474,14 @@ function reconcileProjectShares(config, dryRun, summary) {
 
 function buildDeviceReport(config, lastRunOverride = undefined) {
   const selectedConversations = Object.entries(config.conversations ?? {}).filter(([, event]) => event.selected).map(([id, event]) => {
-    const rollout = findRollout(config.codexHome, id);
+    const rollout = findRollout(config.codexHome, id, config.sqliteHome);
     let audit = null;
     try { if (rollout) audit = auditJsonlFile(rollout); } catch (error) { audit = { semanticOk: false, error: error.message }; }
     return {
       id,
       title: event.title,
       rolloutExists: Boolean(rollout),
-      indexedInStateDb: Boolean(threadRow(config.codexHome, id)),
+      indexedInStateDb: Boolean(threadRow(config.codexHome, id, config.sqliteHome)),
       semanticOk: Boolean(audit?.semanticOk),
       stable: Boolean(audit?.stable),
       persistentDanglingCalls: audit?.persistentDanglingCalls?.length ?? null,
@@ -1541,10 +1630,10 @@ function localCatalogEntry(codexHome, id) {
 
 function conversationAudit(config, selector) {
   const row = resolveThread(config, selector);
-  const rollout = findRollout(config.codexHome, row.id);
+  const rollout = findRollout(config.codexHome, row.id, config.sqliteHome);
   if (!rollout) throw new CodexSyncError(`Rollout not found for ${row.id}`);
   const audit = auditJsonlFile(rollout);
-  const state = threadRow(config.codexHome, row.id);
+  const state = threadRow(config.codexHome, row.id, config.sqliteHome);
   const index = sessionIndexEntry(config.codexHome, row.id);
   const catalog = localCatalogEntry(config.codexHome, row.id);
   const expectedTitle = config.conversations?.[row.id]?.title ?? catalog?.display_title ?? state?.title ?? row.id;
@@ -1635,8 +1724,9 @@ function repairConversationCommand(options, selector) {
       },
     });
   }
+  backupLocalMutation(config, `repair-${before.id}`, rollout, false);
   if (additions.length) fs.appendFileSync(rollout, `${additions.map((item) => JSON.stringify(item)).join("\n")}\n`);
-  const state = threadRow(config.codexHome, before.id) ?? {};
+  const state = threadRow(config.codexHome, before.id, config.sqliteHome) ?? {};
   const title = String(options.title ?? config.conversations?.[before.id]?.title ?? before.indexes.localCatalog?.title ?? state.title ?? before.id).trim() || before.id;
   const metadata = {
     version: FORMAT_VERSION,
@@ -1651,7 +1741,7 @@ function repairConversationCommand(options, selector) {
     hasUserEvent: before.rollout.userMessages > 0 ? 1 : state.has_user_event,
     preview: state.preview || title,
   };
-  ensureThreadIndex(config.codexHome, metadata, rollout, false);
+  ensureThreadIndex(config, metadata, rollout, false);
   const vaultConversationRoot = path.join(config.vault, "conversations", before.id);
   if (fs.existsSync(vaultConversationRoot)) {
     metadata.relativePath = portableRelative(config.codexHome, rollout);
@@ -1704,8 +1794,9 @@ function resolveConversationConflict(options, id) {
       atomicWrite(localBackup, local);
     }
   }
+  backupLocalMutation(config, `resolve-${id}`, destination, false);
   atomicWrite(destination, data);
-  ensureThreadIndex(config.codexHome, metadata, destination, false);
+  ensureThreadIndex(config, metadata, destination, false);
   return { action: "resolved", id, fromDevice: slug(from), archivedHeads: fs.readdirSync(archive).length, localBackup };
 }
 
@@ -1794,22 +1885,22 @@ function doctorCommand(options) {
   let configFile = configPath(options);
   try { ({ config } = loadConfig(options)); } catch (error) { if (!/ENOENT|Cannot read JSON/.test(error.message)) throw error; }
   const codexHome = config?.codexHome ?? detectCodexHome(options);
-  const dbFile = path.join(codexHome, "state_5.sqlite");
+  const dbFile = stateDbFile(codexHome, config?.sqliteHome ?? detectSqliteHome(options, codexHome));
   const api = sqliteApi();
   const checks = {
     node: { ok: Number(process.versions.node.split(".")[0]) >= 22, version: process.versions.node, executable: process.execPath },
     config: { ok: Boolean(config), path: configFile },
     codexHome: { ok: fs.existsSync(codexHome), path: codexHome },
     sessions: { ok: fs.existsSync(path.join(codexHome, "sessions")), path: path.join(codexHome, "sessions") },
-    sqlite: { ok: Boolean(api), stateDbExists: fs.existsSync(dbFile), path: dbFile },
+    sqlite: { ok: Boolean(api), stateDbExists: Boolean(dbFile && fs.existsSync(dbFile)), path: dbFile },
     skillRoots: commonSkillRoots(codexHome),
   };
   if (config) {
     checks.vault = { ok: fs.existsSync(config.vault), path: config.vault, transport: config.transport };
     checks.forbiddenVaultFiles = forbiddenVaultFiles(config.vault);
     checks.selectedConversations = Object.entries(config.conversations ?? {}).filter(([, event]) => event.selected).map(([id, event]) => {
-      const rollout = findRollout(codexHome, id);
-      const indexed = Boolean(threadRow(codexHome, id));
+      const rollout = findRollout(codexHome, id, config.sqliteHome);
+      const indexed = Boolean(threadRow(codexHome, id, config.sqliteHome));
       let audit = null;
       let indexesConsistent = false;
       try {
@@ -1907,7 +1998,20 @@ function daemonPaths(config) {
   const localRoot = path.dirname(config._configFile ?? path.join(CONFIG_ROOT, "config.json"));
   if (process.platform === "win32") return { task: "CodexSync-AutoSync", spec: path.join(localRoot, "codexsync-task.xml") };
   if (process.platform === "darwin") return { task: "com.toussaintknight.codexsync", spec: path.join(os.homedir(), "Library", "LaunchAgents", "com.toussaintknight.codexsync.plist") };
-  return { task: "codexsync-autosync", spec: path.join(localRoot, "codexsync-autosync.service") };
+  return {
+    task: "codexsync-autosync",
+    spec: path.join(os.homedir(), ".config", "systemd", "user", "codexsync-autosync.service"),
+    timer: path.join(os.homedir(), ".config", "systemd", "user", "codexsync-autosync.timer"),
+  };
+}
+
+function systemdUserAvailable() {
+  const probe = run("systemctl", ["--user", "show-environment"], { allowFailure: true });
+  return { available: !probe.error && probe.status === 0, detail: (probe.stderr || probe.stdout || "systemctl --user is unavailable").trim() };
+}
+
+function systemdQuote(value) {
+  return `"${String(value).replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("%", "%%")}"`;
 }
 
 function daemonStatus(config, file) {
@@ -1920,7 +2024,10 @@ function daemonStatus(config, file) {
     const loaded = run("launchctl", ["print", `gui/${process.getuid()}/${target.task}`], { allowFailure: true });
     return { installed: fs.existsSync(target.spec), enabled: loaded.status === 0, ...target };
   }
-  return { installed: false, supported: false, ...target };
+  const systemd = systemdUserAvailable();
+  if (!systemd.available) return { installed: false, enabled: false, supported: false, systemd, ...target };
+  const result = run("systemctl", ["--user", "is-enabled", `${target.task}.timer`], { allowFailure: true });
+  return { installed: fs.existsSync(target.spec) && fs.existsSync(target.timer), enabled: result.status === 0, supported: true, systemd, ...target };
 }
 
 function daemonCommand(options, action) {
@@ -1933,7 +2040,11 @@ function daemonCommand(options, action) {
     else if (process.platform === "darwin") {
       run("launchctl", ["unload", target.spec], { allowFailure: true });
       try { fs.unlinkSync(target.spec); } catch (error) { if (error.code !== "ENOENT") throw error; }
-    } else throw new CodexSyncError("Automatic install currently supports Windows Task Scheduler and macOS LaunchAgents.");
+    } else {
+      run("systemctl", ["--user", "disable", "--now", `${target.task}.timer`], { allowFailure: true });
+      for (const item of [target.spec, target.timer]) try { fs.unlinkSync(item); } catch (error) { if (error.code !== "ENOENT") throw error; }
+      run("systemctl", ["--user", "daemon-reload"], { allowFailure: true });
+    }
     return { action: "uninstalled", ...target };
   }
   if (action !== "install") throw new CodexSyncError(`Unknown daemon action: ${action}`);
@@ -1947,7 +2058,18 @@ function daemonCommand(options, action) {
     const plist = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>${target.task}</string><key>ProgramArguments</key><array><string>${xmlEscape(process.execPath)}</string><string>--no-warnings</string><string>${xmlEscape(SCRIPT_PATH)}</string><string>sync</string><string>--config</string><string>${xmlEscape(file)}</string><string>--quiet</string></array><key>StartInterval</key><integer>${minutes * 60}</integer><key>RunAtLoad</key><true/></dict></plist>`;
     atomicWrite(target.spec, plist, dryRun);
     if (!dryRun) run("launchctl", ["load", "-w", target.spec]);
-  } else throw new CodexSyncError("Automatic install currently supports Windows Task Scheduler and macOS LaunchAgents.");
+  } else {
+    const systemd = systemdUserAvailable();
+    if (!dryRun && !systemd.available) throw new CodexSyncError(`systemd --user is unavailable: ${systemd.detail}`);
+    const service = `[Unit]\nDescription=Codex Sync selected conversations\n\n[Service]\nType=oneshot\nExecStart=${systemdQuote(process.execPath)} --no-warnings ${systemdQuote(SCRIPT_PATH)} sync --config ${systemdQuote(file)} --quiet\n`;
+    const timer = `[Unit]\nDescription=Run Codex Sync periodically\n\n[Timer]\nOnBootSec=2m\nOnUnitActiveSec=${minutes}m\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n`;
+    atomicWrite(target.spec, service, dryRun);
+    atomicWrite(target.timer, timer, dryRun);
+    if (!dryRun) {
+      run("systemctl", ["--user", "daemon-reload"]);
+      run("systemctl", ["--user", "enable", "--now", `${target.task}.timer`]);
+    }
+  }
   return { action: dryRun ? "install-preview" : "installed", minutes, ...target, executable: process.execPath, script: SCRIPT_PATH, config: file };
 }
 

@@ -4,7 +4,7 @@
 
 **Continue the same local Codex project on your trusted computers—without copying credentials, live databases, or unfinished turns.**
 
-Codex Sync is a local-first continuity layer for developers who move between Windows and macOS and want their selected projects, task histories, and personal skills to travel safely with them.
+Codex Sync is a local-first continuity layer for developers who move between Windows, macOS, and Linux and want their selected projects, task histories, and personal skills to travel safely with them.
 
 > The product and Codex Skill are **Codex Sync** / `$codex-sync`. The shell CLI is `codexsync`—not `sync`—to avoid colliding with operating-system utilities. Local protocol state lives under `.codex-sync/`.
 
@@ -117,7 +117,7 @@ Excluded:
 - Independently continuing the same task while devices are disconnected creates an explicit conflict requiring a human choice.
 - Codex Sync does not encrypt the vault itself.
 - Older clients do not understand maintenance mode; disable their schedulers before a fleet upgrade.
-- Windows and macOS are supported today. iPhone and Android continuity is future scope and depends on compatible Codex storage and execution surfaces.
+- Windows, macOS, and Linux are supported. Linux automatic scheduling uses optional `systemd --user`; manual sync never depends on it. iPhone and Android continuity is future scope and depends on compatible Codex storage and execution surfaces.
 - Codex storage formats may evolve; run `doctor` and the test suite after Codex upgrades.
 
 ## Documentation

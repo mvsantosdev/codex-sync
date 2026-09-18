@@ -19,7 +19,7 @@ const damagedId = "019f0000-0000-7000-8000-000000000002";
 function run(args, env = {}) {
   const output = execFileSync(process.execPath, [CLI, ...args, "--json"], {
     encoding: "utf8",
-    env: { ...process.env, NODE_NO_WARNINGS: "1", ...env },
+    env: { ...process.env, HOME: path.join(root, "isolated-home"), USERPROFILE: path.join(root, "isolated-home"), XDG_CONFIG_HOME: path.join(root, "isolated-home", ".config"), CODEX_HOME: path.join(root, "not-real-codex"), NODE_NO_WARNINGS: "1", ...env },
   });
   return JSON.parse(output);
 }
@@ -211,7 +211,7 @@ try {
 
   const preview = run(["sync", "--dry-run", "--config", configA]);
   assert.equal(preview.dryRun, true);
-  if (["win32", "darwin"].includes(process.platform)) {
+  if (["win32", "darwin", "linux"].includes(process.platform)) {
     const daemonPreview = run(["daemon", "install", "--dry-run", "--minutes", "3", "--config", configA]);
     assert.equal(daemonPreview.action, "install-preview");
   } else {
