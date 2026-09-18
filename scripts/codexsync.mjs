@@ -6,9 +6,10 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
-const SCRIPT_PATH = path.resolve(process.argv[1]);
+const SCRIPT_PATH = path.resolve(fileURLToPath(import.meta.url));
 const PACKAGE_VERSION = require("../package.json").version;
 const FORMAT_VERSION = 1;
 const PROTOCOL_REVISION = 3;
@@ -123,6 +124,27 @@ function hashBuffer(buffer) {
 
 function hashFile(file) {
   return hashBuffer(fs.readFileSync(file));
+}
+
+export function protectedFileFingerprint(codexHome) {
+  const file = path.join(codexHome, "thread_history_1.sqlite");
+  return fs.existsSync(file) ? { path: file, hash: hashFile(file), exists: true } : { path: file, hash: null, exists: false };
+}
+
+function isWindowsForeignPath(value) {
+  return /^(?:\\\\\?\\(?:UNC\\)?|\\\\[^\\]+\\[^\\]+|[A-Za-z]:[\\/])/.test(String(value ?? ""));
+}
+
+function localOperationalPath(value, codexHome, kind, maps = []) {
+  const mapped = applyPathMaps(value, maps);
+  if (!mapped) return { ok: false, error: `${kind} is missing` };
+  if (process.platform !== "win32" && isWindowsForeignPath(mapped)) return { ok: false, error: `${kind} is an unmapped Windows path: ${value}` };
+  const normalized = normalizeFsPath(mapped);
+  if (kind === "rollout_path") {
+    const sessions = normalizeFsPath(path.join(codexHome, "sessions"));
+    if (normalized !== sessions && !normalized.startsWith(`${sessions}${path.sep}`)) return { ok: false, error: `${kind} is outside local CODEX_HOME sessions: ${value}` };
+  }
+  return { ok: true, path: normalized };
 }
 
 function isPrefix(shorter, longer) {
@@ -555,6 +577,9 @@ function ensureThreadIndex(config, metadata, rolloutPath, dryRun = false) {
           const placeholders = names.map(() => "?").join(",");
           const updates = ["rollout_path", "updated_at", "updated_at_ms", "title", "preview", "recency_at", "recency_at_ms", "has_user_event"]
             .filter((key) => names.includes(key)).map((key) => `${key}=excluded.${key}`).join(",");
+          if (process.env.CODEX_SYNC_TEST_FAIL_AT === "state") {
+            throw new CodexSyncError("Injected test failure before state write");
+          }
           testTrace("state", stateDbFile(codexHome, sqliteHome));
           db.prepare(`INSERT INTO threads (${names.join(",")}) VALUES (${placeholders}) ON CONFLICT(id) DO UPDATE SET ${updates}`)
             .run(...picked.map(([, value]) => value));
@@ -1348,6 +1373,7 @@ function syncConversations(config, direction, dryRun, summary) {
     } catch (error) {
       summary.conversationErrors += 1;
       summary.warnings.push(`Conversation ${id} failed safely without blocking other collections: ${error.message}`);
+      if (/^Injected test failure/.test(error.message)) summary.fatalSafetyError = error.message;
     }
   }
 }
@@ -1441,6 +1467,7 @@ function newSummary(direction, dryRun) {
     skillConflicts: 0,
     projectSharesAdded: 0,
     warnings: [],
+    safety: null,
   };
 }
 
@@ -1563,6 +1590,10 @@ function syncCommand(options, direction = "sync") {
   const startedAt = nowIso();
   let reportPublished = false;
   try {
+    const preflight = safetyPreflight(config, direction);
+    summary.safety = { status: preflight.status, preflight, postflight: null };
+    if (preflight.status === "fail") throw new CodexSyncError(`Safety preflight failed: ${preflight.errors.join("; ")}`);
+    const protectedBefore = protectedFileFingerprint(config.codexHome);
     ensureVault(config, dryRun);
     if (!dryRun && fs.existsSync(maintenanceFile(config)) && !options.force) {
       throw new CodexSyncError(`Vault maintenance mode is enabled: ${maintenanceFile(config)} (use --force only for a controlled repair run)`);
@@ -1580,6 +1611,10 @@ function syncCommand(options, direction = "sync") {
       saveConfig(file, config, dryRun);
     });
     gitPost(config, dryRun);
+    if (summary.fatalSafetyError) throw new CodexSyncError(summary.fatalSafetyError);
+    summary.safety.postflight = safetyPostflight(config, protectedBefore, direction);
+    summary.safety.status = summary.safety.postflight.status;
+    if (summary.safety.status === "fail") throw new CodexSyncError(`Safety postflight failed: ${summary.safety.postflight.errors.join("; ")}`);
     return summary;
   } catch (error) {
     const failedRun = { ok: false, startedAt, finishedAt: nowIso(), error: error.message, direction };
@@ -1644,11 +1679,12 @@ function conversationAudit(config, selector) {
     expectedTitle,
     rollout: audit,
     indexes: {
-      state: state ? { title: state.title, rolloutPath: state.rollout_path, updatedAt: state.updated_at, hasUserEvent: state.has_user_event } : null,
+      state: state ? { title: state.title, rolloutPath: state.rollout_path, cwd: state.cwd, updatedAt: state.updated_at, hasUserEvent: state.has_user_event } : null,
       sessionIndex: index,
       localCatalog: catalog ? { title: catalog.display_title, updatedAt: catalog.source_updated_at, hostId: catalog.host_id } : null,
       consistent: Boolean(state && index && titleMatches),
     },
+    titleConsistency: titleMatches ? { status: "pass" } : { status: "warning", stateTitle: state?.title ?? null, sessionIndexTitle: index?.thread_name ?? null, localCatalogTitle: catalog?.display_title ?? null },
   };
 }
 
@@ -1867,17 +1903,78 @@ function vaultCommand(options, action) {
 
 function forbiddenVaultFiles(vault) {
   if (!fs.existsSync(vault)) return [];
-  const forbidden = /(^|\/)(auth\.json|config\.toml|\.system)(\/|$)|\.(sqlite|sqlite-shm|sqlite-wal)$|(^|\/)logs?(\/|$)/i;
+  const forbidden = /(^|\/)(auth\.json|config\.toml|\.system)(\/|$)|\.(sqlite|sqlite-shm|sqlite-wal)$|(?:^|\/)[^/]+-(?:wal|shm)$|(^|\/)logs?(\/|$)/i;
   const files = [];
   const visit = (dir) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) visit(full);
+      if (entry.isDirectory() && entry.name !== ".git") visit(full);
       else if (entry.isFile()) files.push(portableRelative(vault, full));
     }
   };
   visit(vault);
   return files.filter((relative) => forbidden.test(relative));
+}
+
+function safetyStatus(errors, warnings) { return errors.length ? "fail" : warnings.length ? "warning" : "pass"; }
+
+function conversationSafety(config, id, strict = false, validateOperationalPaths = false) {
+  const errors = [], warnings = [];
+  let detail = null;
+  try { detail = conversationAudit(config, id); } catch (error) { errors.push(error.message); }
+  if (detail) {
+    if (!detail.rollout.semanticOk) errors.push(`rollout ${id} is semantically unsafe`);
+    const state = detail.indexes.state;
+    if (state && validateOperationalPaths) {
+      for (const [kind, value] of [["rollout_path", state.rolloutPath], ["cwd", state.cwd]]) {
+        const check = localOperationalPath(value, config.codexHome, kind, config.pathMaps ?? []);
+        if (!check.ok) errors.push(check.error);
+      }
+    }
+    if (detail.titleConsistency?.status === "warning") warnings.push(`title mismatch for ${id}`);
+  }
+  if (!strict) {
+    const semantic = errors.filter((item) => /semantically unsafe/.test(item));
+    errors.splice(0, errors.length, ...errors.filter((item) => !/semantically unsafe/.test(item)));
+    warnings.push(...semantic);
+  }
+  return { id, status: safetyStatus(errors, warnings), errors, warnings, detail };
+}
+
+function safetyPreflight(config, direction) {
+  const errors = [], warnings = [];
+  const forbidden = forbiddenVaultFiles(config.vault);
+  if (forbidden.length) errors.push(`Vault contains forbidden local-state files: ${forbidden.join(", ")}`);
+  const conversations = Object.entries(config.conversations ?? {}).filter(([, item]) => item.selected)
+    .map(([id]) => conversationSafety(config, id, direction === "verify", direction === "verify" || direction === "pull"));
+  for (const item of conversations) {
+    for (const error of item.errors) {
+      if (direction === "pull" && /(?:Rollout not found|No local thread matches)/.test(error)) continue;
+      errors.push(error);
+    }
+    warnings.push(...item.warnings);
+  }
+  return { status: safetyStatus(errors, warnings), vault: { forbiddenFiles: forbidden }, conversations: conversations.map(({ detail, ...item }) => item), errors, warnings };
+}
+
+export function safetyPostflight(config, before, direction) {
+  const postflight = safetyPreflight(config, direction);
+  const after = protectedFileFingerprint(config.codexHome);
+  const protectedFiles = { thread_history_1: { beforeHash: before.hash, afterHash: after.hash, unchanged: before.hash === after.hash && before.exists === after.exists } };
+  const errors = [...postflight.errors];
+  if (!protectedFiles.thread_history_1.unchanged) errors.push("Protected file thread_history_1.sqlite changed during codex-sync operation");
+  const backups = config._localBackupState ? { created: config._localBackupState.files.size > 0, path: config._localBackupState.root, files: [...config._localBackupState.files] } : { created: false, path: null, files: [] };
+  return { ...postflight, status: safetyStatus(errors, postflight.warnings), errors, protectedFiles, backups };
+}
+
+function verifyCommand(options, selector = null) {
+  const { config, file } = loadConfig(options);
+  const original = config.conversations;
+  if (selector) config.conversations = { [resolveThread(config, selector).id]: { selected: true } };
+  const preflight = safetyPreflight(config, "verify");
+  config.conversations = original;
+  const protectedFile = protectedFileFingerprint(config.codexHome);
+  return { status: preflight.status, readOnly: true, config: file, preflight, protectedFiles: { thread_history_1: { beforeHash: protectedFile.hash, afterHash: protectedFile.hash, unchanged: true } }, warnings: preflight.warnings, errors: preflight.errors };
 }
 
 function doctorCommand(options) {
@@ -2074,7 +2171,7 @@ function daemonCommand(options, action) {
 }
 
 function helpText() {
-  return `Codex Sync v${PACKAGE_VERSION}\n\nCLI command: codexsync\n\nCommands:\n  init --vault PATH [--transport folder|git] [--repo URL]\n  vault use --vault PATH [--transport folder|git] [--repo URL]\n  sync|push|pull [--dry-run]\n  status | doctor\n  maintenance on|off|status [--reason TEXT]\n  conversation select <current|id|title>\n  conversation unselect <id|title>\n  conversation list\n  conversation audit <current|id|title>\n  conversation repair <current|id|title> [--title TITLE]\n  conversation resolve <id> --from-device DEVICE\n  skills list|discover\n  skills add --name NAME --path PATH [--exclude NAME]\n  skills remove NAME\n  skills install NAME --to PATH\n  project discover | project catalogs\n  project add|select <current|PATH> [--id ID] [--label LABEL] [--share-with all|DEVICE] [--ignore PATTERN] [--no-tasks]\n  project tasks <current|PATH>\n  project accept <ID> --path PATH [--no-register]\n  project map --from SOURCE_PATH --to LOCAL_PATH | project register <current|PATH>\n  project list | project status <ID|PATH> | project rescan <ID|PATH>\n  project remove <ID|PATH>  (registration only; keeps local files)\n  syncthing configure --syncthing-exe PATH | syncthing status\n  syncthing add-device --device-id ID [--name NAME]\n  device report | device list\n  daemon install|uninstall|status [--minutes 5] [--dry-run]\n\nGlobal options: --config PATH --json --quiet`;
+  return `Codex Sync v${PACKAGE_VERSION}\n\nCLI command: codexsync\n\nCommands:\n  init --vault PATH [--transport folder|git] [--repo URL]\n  vault use --vault PATH [--transport folder|git] [--repo URL]\n  sync|push|pull [--dry-run]\n  status | doctor | verify\n  maintenance on|off|status [--reason TEXT]\n  conversation select <current|id|title>\n  conversation unselect <id|title>\n  conversation list\n  conversation audit|verify <current|id|title>\n  conversation repair <current|id|title> [--title TITLE]\n  conversation resolve <id> --from-device DEVICE\n  skills list|discover\n  skills add --name NAME --path PATH [--exclude NAME]\n  skills remove NAME\n  skills install NAME --to PATH\n  project discover | project catalogs\n  project add|select <current|PATH> [--id ID] [--label LABEL] [--share-with all|DEVICE] [--ignore PATTERN] [--no-tasks]\n  project tasks <current|PATH>\n  project accept <ID> --path PATH [--no-register]\n  project map --from SOURCE_PATH --to LOCAL_PATH | project register <current|PATH>\n  project list | project status <ID|PATH> | project rescan <ID|PATH>\n  project remove <ID|PATH>  (registration only; keeps local files)\n  syncthing configure --syncthing-exe PATH | syncthing status\n  syncthing add-device --device-id ID [--name NAME]\n  device report | device list\n  daemon install|uninstall|status [--minutes 5] [--dry-run]\n\nGlobal options: --config PATH --json --quiet`;
 }
 
 function printResult(result, options) {
@@ -2096,6 +2193,7 @@ async function main() {
   else if (command === "syncthing") result = syncthingCommand(options, subcommand ?? "status");
   else if (command === "device") result = deviceCommand(options, subcommand ?? "list");
   else if (["sync", "push", "pull"].includes(command)) result = syncCommand(options, command);
+  else if (command === "verify") result = verifyCommand(options);
   else if (command === "status") result = statusCommand(options);
   else if (command === "doctor") result = doctorCommand(options);
   else if (command === "conversation") {
@@ -2103,6 +2201,7 @@ async function main() {
     else if (subcommand === "unselect") result = selectConversation(options, rest.join(" "), false);
     else if (subcommand === "list") result = listConversationSelections(options);
     else if (subcommand === "audit") result = auditConversationCommand(options, rest.join(" ") || "current");
+    else if (subcommand === "verify") result = verifyCommand(options, rest.join(" ") || "current");
     else if (subcommand === "repair") result = repairConversationCommand(options, rest.join(" ") || "current");
     else if (subcommand === "resolve") result = resolveConversationConflict(options, rest[0]);
     else throw new CodexSyncError(`Unknown conversation action: ${subcommand}`);
@@ -2110,11 +2209,14 @@ async function main() {
   else if (command === "daemon") result = daemonCommand(options, subcommand ?? "status");
   else throw new CodexSyncError(`Unknown command: ${command}`);
   printResult(result, options);
+  if (result?.status === "fail") process.exitCode = 1;
 }
 
-main().catch((error) => {
-  const message = error instanceof CodexSyncError ? error.message : `${error.name}: ${error.message}`;
-  console.error(`codex-sync: ${message}`);
-  if (process.env.CODEX_SYNC_DEBUG) console.error(error.stack);
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === SCRIPT_PATH) {
+  main().catch((error) => {
+    const message = error instanceof CodexSyncError ? error.message : `${error.name}: ${error.message}`;
+    console.error(`codex-sync: ${message}`);
+    if (process.env.CODEX_SYNC_DEBUG) console.error(error.stack);
+    process.exitCode = 1;
+  });
+}

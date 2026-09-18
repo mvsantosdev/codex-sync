@@ -6,6 +6,7 @@ import path from "node:path";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { protectedFileFingerprint, safetyPostflight } from "./codexsync.mjs";
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require("node:sqlite");
@@ -15,6 +16,7 @@ const id = "019f0000-0000-7000-8000-000000000099";
 const checks = [];
 function check(name, condition) { assert.ok(condition, name); checks.push({ name, result: "PASS" }); }
 const run = (args, env = {}) => JSON.parse(execFileSync(process.execPath, [cli, ...args, "--json"], { encoding: "utf8", env: { ...process.env, HOME: path.join(root, "isolated-home"), USERPROFILE: path.join(root, "isolated-home"), XDG_CONFIG_HOME: path.join(root, "isolated-home", ".config"), CODEX_HOME: path.join(root, "not-real-codex"), NODE_NO_WARNINGS: "1", ...env } }));
+const runFails = (args, env = {}) => { try { run(args, env); } catch (error) { return `${error.stderr ?? ""}${error.stdout ?? ""}${error.message ?? ""}`; } throw new Error(`expected failure: ${args.join(" ")}`); };
 function db(file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const value = new DatabaseSync(file);
@@ -56,5 +58,30 @@ try {
   const emptyHome = path.join(root, "empty-home"); const emptySqlite = path.join(root, "empty-sqlite"); const emptyConfig = path.join(root, "empty.json"); fs.mkdirSync(emptySqlite, { recursive: true });
   run(["init", "--vault", path.join(root, "empty-vault"), "--device", "empty", "--codex-home", emptyHome, "--codex-sqlite-home", emptySqlite, "--config", emptyConfig]); run(["doctor", "--config", emptyConfig]); run(["sync", "--dry-run", "--config", emptyConfig]);
   check("absent-sqlite-not-created", !fs.existsSync(path.join(emptySqlite, "state_5.sqlite")));
+  // Safety validates operational state, not historical JSONL strings.
+  const localHash = fs.readFileSync(local, "utf8"); const verifyB = run(["verify", "--config", b]);
+  check("historical-foreign-path-is-allowed", verifyB.status === "pass" && fs.readFileSync(local, "utf8") === localHash);
+  const configBBytes = fs.readFileSync(b); const configB = JSON.parse(configBBytes); configB.pathMaps = []; fs.writeFileSync(b, `${JSON.stringify(configB, null, 2)}\n`);
+  const linuxDbFile = path.join(linuxSqlite, "state_5.sqlite"); const linuxDb = new DatabaseSync(linuxDbFile);
+  const originalCwd = linuxDb.prepare("SELECT cwd FROM threads WHERE id=?").get(id).cwd; const originalRollout = linuxDb.prepare("SELECT rollout_path FROM threads WHERE id=?").get(id).rollout_path;
+  for (const [name, foreign] of [["foreign-drive-safety-fails", "C:\\Users\\tester\\projects\\demo"], ["unc-safety-fails", "\\\\server\\share\\project"], ["extended-path-safety-fails", "\\\\?\\C:\\Users\\tester\\projects\\demo"]]) {
+    linuxDb.prepare("UPDATE threads SET cwd=? WHERE id=?").run(foreign, id); check(name, /cwd.*(?:unmapped|Windows)/i.test(runFails(["conversation", "verify", id, "--config", b])));
+  }
+  linuxDb.prepare("UPDATE threads SET cwd=?,rollout_path=? WHERE id=?").run(originalCwd, path.join(root, "foreign-rollout.jsonl"), id); check("invalid-rollout-path-safety-fails", /outside local CODEX_HOME sessions/.test(runFails(["conversation", "verify", id, "--config", b])));
+  linuxDb.prepare("UPDATE threads SET rollout_path=? WHERE id=?").run(originalRollout, id); linuxDb.close(); check("valid-rollout-path-safety-passes", run(["verify", "--config", b]).status === "pass"); fs.writeFileSync(b, configBBytes);
+  const dryFiles = [local, linuxDbFile, path.join(linuxHome, "session_index.jsonl"), path.join(vault, "conversations", id, "canonical.jsonl"), path.join(vault, "conversations", id, "heads", "win-fixture.jsonl"), b].map((file) => [file, fs.readFileSync(file).toString("hex")]);
+  run(["sync", "--dry-run", "--config", b]); check("dry-run-preserves-all-observed-hashes", dryFiles.every(([file, hash]) => fs.readFileSync(file).toString("hex") === hash));
+  // The harness, not codexsync, changes the protected file between the real
+  // fingerprint and postflight functions.
+  const protectedFile = path.join(linuxHome, "thread_history_1.sqlite"); fs.writeFileSync(protectedFile, "protected-before");
+  const protectedBefore = protectedFileFingerprint(linuxHome); fs.writeFileSync(protectedFile, "externally-mutated-by-test-harness");
+  const protectedPostflight = safetyPostflight({ codexHome: linuxHome, vault, conversations: {}, pathMaps: [] }, protectedBefore, "verify");
+  check("protected-file-violation-detected", protectedPostflight.status === "fail" && protectedPostflight.protectedFiles.thread_history_1.unchanged === false);
+  // A second extension exercises deterministic failure after backup and rollout write.
+  fs.appendFileSync(rollout, `${JSON.stringify({ timestamp: "2026-01-01T00:00:03.000Z", type: "event_msg", payload: { type: "user_message", message: "fault fixture" } })}\n`); run(["sync", "--config", a]);
+  const fault = runFails(["pull", "--config", b], { CODEX_SYNC_TEST_FAIL_AT: "state", CODEX_SYNC_TEST_TRACE: trace });
+  const backupAfterFault = fs.readdirSync(path.join(root, "backups"), { recursive: true });
+  check("fault-after-backup-is-failure", /Injected test failure before state write/.test(fault) && backupAfterFault.some((item) => item.endsWith("state_5.sqlite")) && backupAfterFault.some((item) => item.endsWith("session_index.jsonl")));
+  check("fault-does-not-leak-sqlite-to-vault", !fs.readdirSync(vault, { recursive: true }).some((item) => /(?:\.sqlite(?:-(?:wal|shm))?|-(?:wal|shm))$/i.test(String(item))));
   console.log(JSON.stringify({ ok: true, totalChecks: checks.length, checks }, null, 2));
 } finally { fs.rmSync(root, { recursive: true, force: true }); }

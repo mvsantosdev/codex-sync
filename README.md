@@ -120,6 +120,20 @@ Excluded:
 - Windows, macOS, and Linux are supported. Linux automatic scheduling uses optional `systemd --user`; manual sync never depends on it. iPhone and Android continuity is future scope and depends on compatible Codex storage and execution surfaces.
 - Codex storage formats may evolve; run `doctor` and the test suite after Codex upgrades.
 
+## Safety verification
+
+`node scripts/codexsync.mjs verify --json` is a read-only audit of the vault,
+selected rollout semantic health, operational paths, and the protected
+`thread_history_1.sqlite` fingerprint. `conversation verify <id-or-title>`
+narrows the same audit. Cosmetic title disagreement is a warning; forbidden
+SQLite transport files and unsafe operational state fail.
+
+Push, pull, and sync reuse preflight and postflight verification. Canonical
+JSONL and heads are transport data; SQLite remains local and is never copied
+to the vault. Historical JSONL paths are byte-preserved, while operational
+`cwd` and `rollout_path` are localized by path mapping. `--dry-run` writes no
+state.
+
 ## Documentation
 
 - [Demonstration](docs/demo.md)

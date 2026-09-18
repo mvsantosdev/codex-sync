@@ -120,6 +120,17 @@ GitHub Actions 在 Windows、macOS 和 Linux 的 Node.js 22 环境中运行同�
 - 当前支持 Windows 与 macOS。iPhone 和 Android 连续工作属于未来范围，并依赖兼容的 Codex 存储与执行界面。
 - Codex 存储格式可能变化；Codex 升级后应运行 `doctor` 与测试套件。
 
+## 安全验证
+
+`node scripts/codexsync.mjs verify --json` 是只读审计，检查 vault、已选择
+rollout 的语义健康度、运行路径及受保护的 `thread_history_1.sqlite` 指纹。
+`conversation verify <id-or-title>` 将审计限定到一条会话。标题外观差异是
+warning；禁止的 SQLite 传输文件和不安全运行状态会失败。
+
+push、pull 与 sync 复用 preflight 和 postflight 验证。canonical JSONL 与 heads
+是传输数据；SQLite 始终保持本地，绝不会复制到 vault。历史 JSONL 路径按字节保留，
+运行 `cwd` 和 `rollout_path` 则通过 path mapping 本地化。`--dry-run` 不写入状态。
+
 ## 文档
 
 - [演示](docs/demo.zh-CN.md)

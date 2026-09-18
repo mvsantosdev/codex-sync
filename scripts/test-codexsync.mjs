@@ -221,6 +221,20 @@ try {
   assert.equal(doctor.ok, true);
   const status = run(["status", "--config", configA]);
   assert.equal(status.selectedConversations.length, 1);
+  const protectedHistory = path.join(b.home, "thread_history_1.sqlite");
+  fs.writeFileSync(protectedHistory, "synthetic protected bytes");
+  const verifyInputs = [rolloutB, path.join(b.home, "state_5.sqlite"), path.join(b.home, "session_index.jsonl"), protectedHistory]
+    .map((file) => [file, fs.readFileSync(file).toString("hex")]);
+  const verified = run(["verify", "--config", configB]);
+  assert.equal(verified.status, "pass");
+  assert.equal(verified.protectedFiles.thread_history_1.unchanged, true);
+  assert.deepEqual(verifyInputs, verifyInputs.map(([file]) => [file, fs.readFileSync(file).toString("hex")]));
+  for (const name of ["nested/foo.sqlite", "nested/foo.sqlite-wal", "nested/foo.sqlite-shm", "nested/foo-wal", "nested/foo-shm"]) {
+    const file = path.join(vault, ...name.split("/"));
+    fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, "x");
+    assert.match(runFails(["verify", "--config", configB]), /forbidden local-state files/);
+    fs.unlinkSync(file);
+  }
 
   const damagedVault = path.join(root, "damaged-vault");
   const damagedA = makeHome("home-damaged-a");
@@ -350,7 +364,8 @@ try {
   assert.equal(relocation.action, "vault-updated");
   assert.ok(fs.existsSync(path.join(relocatedVault, "skills", "codex", "git-skill", "SKILL.md")));
 
-  console.log(JSON.stringify({ ok: true, root, checks: 70, projectDiscovery: true, projectTaskSelection: true, projectCatalogs: true, projectPathMapping: true, deviceReports: true, noOpWrites: true, stableActiveCheckpoint: true, extendedWindowsPath: true, semanticRepair: true, legacyAbortRepair: true, unsafeCanonicalQuarantine: true, activeTurnProtection: true, perDeviceMetadata: true, desktopCatalogImport: true, maintenanceMode: true, maintenanceBootstrap: process.platform === "win32", folderTransport: true, gitTransport: true, vaultRelocation: true, conversationImport: true, skillThreeWay: true, conflictRecovery: true, daemonPreview: true }, null, 2));
+  const checks = (fs.readFileSync(new URL(import.meta.url), "utf8").match(/\bassert\./g) ?? []).length;
+  console.log(JSON.stringify({ ok: true, root, checks, projectDiscovery: true, projectTaskSelection: true, projectCatalogs: true, projectPathMapping: true, deviceReports: true, noOpWrites: true, stableActiveCheckpoint: true, extendedWindowsPath: true, semanticRepair: true, legacyAbortRepair: true, unsafeCanonicalQuarantine: true, activeTurnProtection: true, perDeviceMetadata: true, desktopCatalogImport: true, maintenanceMode: true, maintenanceBootstrap: process.platform === "win32", folderTransport: true, gitTransport: true, vaultRelocation: true, conversationImport: true, skillThreeWay: true, conflictRecovery: true, daemonPreview: true, safetyVerification: true }, null, 2));
 } catch (error) {
   console.error(`E2E FAILED; artifacts kept at ${root}`);
   throw error;
