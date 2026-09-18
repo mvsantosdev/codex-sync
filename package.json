@@ -11,7 +11,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --no-warnings scripts/test-codexsync.mjs",
+    "test": "node --no-warnings scripts/test-codexsync.mjs && node --no-warnings scripts/test-linux-cross-platform.mjs",
     "privacy:scan": "node scripts/check-repo-hygiene.mjs",
     "docs:check": "node scripts/check-docs.mjs",
     "check": "npm run privacy:scan && npm run docs:check && npm test"
